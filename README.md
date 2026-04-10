@@ -1,151 +1,329 @@
-## 🚧 Project Status: Under Construction
-
-> ⚠️ **This project is currently under active development.**
-
-
 # case-widget-middleware
 
-Serverless middleware for embedding a Salesforce Case creation widget on any website. Handles domain-based CORS, widget config caching, reCAPTCHA v3 verification, and RSA-encrypted credentials.
+> Experimental portfolio project.
 
----
+This repository is an experimental serverless middleware that sits between an embeddable support widget and Salesforce. Its purpose is to showcase how I design and implement flows like:
 
-## Overview
+- domain-based widget configuration
+- webhook sync from Salesforce into KV
+- request validation and structured API errors
+- reCAPTCHA verification
+- server-side secret handling
+- middleware-to-Salesforce case creation
+- basic operational concerns such as logging, CORS, and rate limiting
 
-This middleware acts as a secure bridge between an embeddable Case widget and a Salesforce org. It prevents direct exposure of Salesforce credentials, enforces domain-based access control, and validates reCAPTCHA tokens before creating Cases.
+It is intentionally public as a portfolio/showcase repo, not as a finished product or production-ready template.
 
-```
-[Widget on any site] → [This middleware] → [Salesforce API]
-```
+## What It Does
 
----
+The middleware exposes three endpoints:
 
-## Architecture
-
-### Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
+| Method | Path | Purpose |
+| --- | --- | --- |
 | `GET` | `/api/config` | Returns widget config for the requesting domain |
-| `POST` | `/api/cases` | Validates reCAPTCHA and creates a Case in Salesforce |
-| `POST` | `/api/sync` | Receives webhook from Salesforce to update domain config |
+| `POST` | `/api/submit` | Validates widget input, verifies reCAPTCHA, applies rate limit, and creates a Salesforce Case |
+| `POST` | `/api/sync` | Receives a signed payload from Salesforce and updates the config cached in Upstash Redis |
 
-### How domain config works
+High-level flow:
 
-An admin in Salesforce registers a domain and its widget configuration. Every time a domain is added, edited, or deleted, Salesforce fires a webhook to `/api/sync`. The middleware updates its KV store accordingly.
+```text
+[Widget] -> [/api/config] -> [Upstash Redis]
+[Widget] -> [/api/submit] -> [reCAPTCHA] -> [Salesforce Case API]
+[Salesforce] -> [/api/sync] -> [Upstash Redis]
+```
 
-When a widget loads on a registered domain, it calls `/api/config` — the middleware responds from cache (KV) without touching Salesforce.
+## Why This Repo Exists
 
-### Security model
+This project is a compact example of the kind of backend integration work I can build:
 
-- **CORS is dynamic** — only registered domains are allowed to call the middleware
-- **HMAC signature** — every webhook from Salesforce is signed; the middleware verifies it before processing
-- **reCAPTCHA v3** — every Case creation is validated against Google's API
-- **RSA encryption** — the reCAPTCHA secret key is stored encrypted in Salesforce and decrypted in the middleware using a private key stored only in Vercel environment variables
-- **Salesforce credentials** — never exposed to the frontend; only used server-side
+- API contract design
+- middleware security boundaries
+- third-party system integration
+- serverless implementation on Vercel
+- pragmatic TypeScript architecture for small, real-world services
 
----
+The point is not to simulate a massive platform. The point is to show judgment on a small but credible workflow.
+
+## Current Status
+
+This repo is:
+
+- experimental
+- actively shaped as a showcase project
+- suitable for demos, review, and technical discussion
+- not positioned as a hardened production package
+
+What is implemented today:
+
+- shared `CaseWidgetConfig` contract
+- domain normalization before lookup/persistence
+- structured validation for submit payloads
+- structured submit error responses
+- HMAC validation for sync payloads
+- reCAPTCHA verification
+- Redis-backed config storage
+- basic rate limiting on `POST /api/submit` by `domain + client IP`
+- request/error logging with request context
+- basic CORS handling aligned to allowed origins
+- TypeScript typecheck and focused tests
+
+What is intentionally still lightweight:
+
+- no replay protection on `sync`
+- no full integration or e2e test suite
+- no advanced abuse detection beyond basic rate limit
+- no full observability stack
+- no deployment automation or release workflow
+
+## API Shape
+
+### `GET /api/config`
+
+Returns a stable response for the widget.
+
+If the origin is not known:
+
+```json
+{
+  "config_version": null,
+  "allowed": false,
+  "data": null
+}
+```
+
+If the origin is registered:
+
+```json
+{
+  "config_version": "v1",
+  "allowed": true,
+  "data": {
+    "title": "Need help?",
+    "description": "Describe your issue",
+    "submit_label": "Send",
+    "cancel_label": "Cancel",
+    "recaptcha_use_disclosure": "Protected by reCAPTCHA",
+    "recaptcha": {
+      "siteKey": "..."
+    },
+    "form": {
+      "messages": {
+        "submit_message": "Sending...",
+        "success_message": "Done"
+      },
+      "fields": {
+        "subject": { "label": "Subject" },
+        "type": {
+          "label": "Type",
+          "options": [
+            { "label": "Bug", "value": "bug" }
+          ]
+        },
+        "description": { "label": "Description" },
+        "email": { "label": "Email" }
+      }
+    }
+  }
+}
+```
+
+### `POST /api/submit`
+
+Expected request body:
+
+```ts
+type CaseWidgetSubmitRequest = {
+  subject: string;
+  description: string;
+  email: string;
+  type: string;
+  captcha_token: string;
+  meta: Record<string, unknown>;
+};
+```
+
+Success response:
+
+```json
+{
+  "success": true,
+  "caseId": "500...",
+  "caseNumber": "00001024"
+}
+```
+
+Error response shape:
+
+```json
+{
+  "success": false,
+  "errors": {
+    "general": [
+      {
+        "code": "rate_limit_exceeded",
+        "message": "too many requests for this site and IP"
+      }
+    ]
+  }
+}
+```
+
+### `POST /api/sync`
+
+`sync` accepts:
+
+```ts
+type SyncAction = "upsert" | "delete";
+
+type CaseWidgetConfig = {
+  config_version: string;
+  title: string;
+  description: string;
+  submit_label: string;
+  cancel_label: string;
+  recaptcha_use_disclosure: string;
+  recaptcha_site_key: string;
+  recaptcha_secret_key_encrypted: string;
+  submit_message: string;
+  success_message: string;
+  subject_label: string;
+  description_label: string;
+  email_label: string;
+  type_label: string;
+  type_options: Array<{
+    id: string;
+    label: string;
+    value: string;
+  }>;
+};
+
+type SyncPayload = {
+  action: SyncAction;
+  domain: string;
+  config?: CaseWidgetConfig;
+};
+```
+
+The payload is signed using:
+
+- header: `x-signature`
+- algorithm: `HMAC-SHA256`
+- encoding: `hex`
+- content: raw request body
+
+## Technical Notes
+
+### Domain handling
+
+Domains are normalized before persistence and lookup:
+
+- trim whitespace
+- lowercase
+- accept hostname or full URL
+- remove port
+- remove trailing dot
+- preserve subdomains
+
+### `type` mapping
+
+The widget sends `type` using the public `value`.
+
+The middleware:
+
+1. looks up the option by `value`
+2. resolves the internal `id`
+3. sends that `id` to Salesforce
+
+The target Salesforce field is configured with:
+
+```bash
+SALESFORCE_TYPE_FIELD_API_NAME=Type
+```
+
+### Rate limiting
+
+`POST /api/submit` is rate-limited using Upstash Redis by:
+
+```text
+domain + client IP
+```
+
+Default config:
+
+```bash
+RATE_LIMIT_WINDOW_SECONDS=600
+RATE_LIMIT_MAX_REQUESTS=10
+```
 
 ## Stack
 
-- **Runtime**: Node.js + TypeScript
-- **Platform**: Vercel (serverless functions)
-- **Cache / KV**: Upstash Redis (`@upstash/redis`)
-- **CRM**: Salesforce (Service Cloud)
-- **Bot protection**: Google reCAPTCHA v3
+- Node.js
+- TypeScript
+- Vercel serverless functions
+- Upstash Redis
+- Salesforce REST API
+- Google reCAPTCHA v3
 
----
+## Project Structure
 
-## Project structure
-
+```text
+api/
+  config.ts
+  submit.ts
+  sync.ts
+lib/
+  case-widget.ts
+  cors.ts
+  domain.ts
+  hmac.ts
+  kv.ts
+  logging.ts
+  rate-limit.ts
+  request-body.ts
+  salesforce.ts
+  submit.ts
+  sync.ts
+tests/
+types/
 ```
-case-widget-middleware/
-├── api/
-│   ├── config.ts        ← GET widget config by domain
-│   ├── cases.ts         ← POST create Case in Salesforce
-│   └── sync.ts          ← POST receive Salesforce webhook
-├── lib/
-│   ├── hmac.ts          ← HMAC signature verification
-│   ├── kv.ts            ← Upstash Redis helpers
-│   └── salesforce.ts    ← Salesforce REST API client
-├── .env.example         ← Required environment variables template
-├── vercel.json          ← Vercel function configuration
-└── README.md
-```
 
----
+## Environment Variables
 
-## Environment variables
+See [.env.example](./.env.example).
 
-Copy `.env.example` to `.env.local` and fill in your values:
+Current variables:
 
 ```bash
 # Salesforce
 SALESFORCE_CLIENT_ID=
 SALESFORCE_CLIENT_SECRET=
 SALESFORCE_INSTANCE_URL=
+SALESFORCE_TYPE_FIELD_API_NAME=Type
 
-# HMAC — shared secret between Salesforce and this middleware
+# HMAC
 HMAC_SECRET=
 
 # Upstash Redis
 UPSTASH_REDIS_REST_URL=
 UPSTASH_REDIS_REST_TOKEN=
+RATE_LIMIT_WINDOW_SECONDS=600
+RATE_LIMIT_MAX_REQUESTS=10
 
-# RSA private key for decrypting reCAPTCHA secret keys
+# Encryption
 MASTER_PRIVATE_KEY=
+
+# reCAPTCHA
+RECAPTCHA_EXPECTED_ACTION=submit
+RECAPTCHA_MIN_SCORE=0.5
 ```
 
----
-
-## Salesforce setup (required)
-
-> Salesforce setup guide coming soon.
-
----
-
-## Generating required keys
-
-### HMAC shared secret
+## Local Checks
 
 ```bash
-node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+npm run typecheck
+npm test
 ```
 
-### RSA key pair
+## Disclaimer
 
-```bash
-openssl genrsa -out private.pem 2048
-openssl rsa -in private.pem -pubout -out public.pem
-```
-
-- `private.pem` → goes in `MASTER_PRIVATE_KEY` env var (never commit this)
-- `public.pem` → goes in Salesforce Protected Custom Metadata
-
----
-
-## Local development
-
-```bash
-npm install
-vercel dev
-```
-
----
-
-## Deploy
-
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/your-username/case-widget-middleware)
-
-Or manually:
-
-```bash
-vercel deploy
-```
-
----
-
-## Roadmap
-
-- [ ] Work in progress
-- [ ] Salesforce setup guide
-
+This is an experimental showcase repository. It demonstrates implementation patterns and engineering judgment, but it should not be treated as a drop-in production product without additional hardening, integration testing, and operational setup.

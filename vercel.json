@@ -1,7 +1,7 @@
 {
   "functions": {
     "api/sync.ts": { "maxDuration": 10 },
-    "api/cases.ts": { "maxDuration": 10 },
+    "api/submit.ts": { "maxDuration": 10 },
     "api/config.ts": { "maxDuration": 5 }
   }
 }
